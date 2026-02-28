@@ -11,6 +11,35 @@ spring:
       hibernate:
         format_sql: true
 
+# Actuator endpoints for health checks
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when_authorized
+  info:
+    env:
+      enabled: true
+
+# Application info for /actuator/info
+info:
+  app:
+    name: Splitwise Clone API
+    version: 1.0.0
+    description: Production-grade expense sharing backend
+
+# Swagger UI customization
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    tags-sorter: alpha
+    operations-sorter: alpha
+  api-docs:
+    path: /api-docs
+
 logging:
   level:
     com.split.splitwise: DEBUG
