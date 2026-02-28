@@ -5,11 +5,10 @@ import com.split.splitwise.dto.response.BalanceResponse;
 import com.split.splitwise.dto.response.ExpenseResponse;
 import com.split.splitwise.dto.response.SettlementResponse;
 import com.split.splitwise.entity.*;
-import com.split.splitwise.exception.BusinessRuleException;
-import com.split.splitwise.exception.ValidationException;
 import com.split.splitwise.mapper.ExpenseMapper;
 import com.split.splitwise.repository.ExpenseRepository;
-import com.split.splitwise.repository.GroupMemberRepository;
+import com.split.splitwise.service.split.SplitStrategy;
+import com.split.splitwise.service.split.SplitStrategyFactory;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -20,6 +19,15 @@ import java.math.RoundingMode;
 import java.util.*;
 import java.util.stream.Collectors;
 
+/**
+ * Service for managing expenses.
+ * 
+ * Design Patterns Used:
+ * - Strategy Pattern: Split calculation delegated to SplitStrategy implementations
+ * - Factory Pattern: SplitStrategyFactory creates appropriate strategy
+ * 
+ * This follows Open/Closed Principle - add new split types without modifying this class.
+ */
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -30,11 +38,11 @@ public class ExpenseService {
     private static final RoundingMode ROUNDING_MODE = RoundingMode.HALF_UP;
 
     private final ExpenseRepository expenseRepository;
-    private final GroupMemberRepository groupMemberRepository;
     private final GroupService groupService;
     private final UserService userService;
     private final ExpenseMapper expenseMapper;
     private final SettlementService settlementService;
+    private final SplitStrategyFactory splitStrategyFactory;
 
     @Transactional
     public ExpenseResponse createExpense(UUID groupId, CreateExpenseRequest request) {
@@ -63,97 +71,19 @@ public class ExpenseService {
         return expenseMapper.toResponse(savedExpense);
     }
 
+    /**
+     * Creates splits using the Strategy Pattern.
+     * 
+     * The factory determines which strategy to use based on split type,
+     * then the strategy handles the actual split calculation.
+     * 
+     * Benefits:
+     * - Adding PERCENTAGE split? Just create PercentageSplitStrategy, register in factory
+     * - No changes needed in ExpenseService (Open/Closed Principle)
+     */
     private List<ExpenseSplit> createSplits(Expense expense, UUID groupId, CreateExpenseRequest request) {
-        return switch (request.getSplitType()) {
-            case EQUAL -> createEqualSplits(expense, groupId);
-            case EXACT -> createExactSplits(expense, groupId, request);
-        };
-    }
-
-    /**
-     * Creates equal splits among all group members.
-     * 
-     * Handles rounding by giving the remainder to the last member.
-     * Example: $100 split among 3 people = $33.33, $33.33, $33.34
-     * 
-     * Why this approach:
-     * - Naive division would lose cents due to rounding
-     * - We calculate per-person amount, then adjust the last person
-     * - This ensures total always matches exactly
-     */
-    private List<ExpenseSplit> createEqualSplits(Expense expense, UUID groupId) {
-        List<GroupMember> members = groupMemberRepository.findByGroupIdWithUser(groupId);
-
-        if (members.isEmpty()) {
-            throw new BusinessRuleException("Cannot split expense: group has no members");
-        }
-
-        int memberCount = members.size();
-        BigDecimal totalAmount = expense.getTotalAmount();
-
-        BigDecimal perPersonAmount = totalAmount
-                .divide(BigDecimal.valueOf(memberCount), MONEY_SCALE, ROUNDING_MODE);
-
-        BigDecimal allocatedAmount = perPersonAmount.multiply(BigDecimal.valueOf(memberCount - 1));
-        BigDecimal lastPersonAmount = totalAmount.subtract(allocatedAmount);
-
-        List<ExpenseSplit> splits = new ArrayList<>();
-        for (int i = 0; i < members.size(); i++) {
-            GroupMember member = members.get(i);
-            BigDecimal amount = (i == members.size() - 1) ? lastPersonAmount : perPersonAmount;
-
-            ExpenseSplit split = ExpenseSplit.builder()
-                    .user(member.getUser())
-                    .amountOwed(amount)
-                    .build();
-            splits.add(split);
-        }
-
-        log.debug("Created {} equal splits for expense", splits.size());
-        return splits;
-    }
-
-    /**
-     * Creates exact splits based on user-provided amounts.
-     * 
-     * Validates:
-     * - All specified users are group members
-     * - Sum of splits equals total amount exactly
-     */
-    private List<ExpenseSplit> createExactSplits(Expense expense, UUID groupId, CreateExpenseRequest request) {
-        if (request.getSplits() == null || request.getSplits().isEmpty()) {
-            throw new ValidationException("Exact split requires split details");
-        }
-
-        Set<UUID> memberIds = groupService.getGroupMemberIds(groupId);
-        BigDecimal totalSplitAmount = BigDecimal.ZERO;
-        List<ExpenseSplit> splits = new ArrayList<>();
-
-        for (CreateExpenseRequest.SplitDetail splitDetail : request.getSplits()) {
-            if (!memberIds.contains(splitDetail.getUserId())) {
-                throw new BusinessRuleException(
-                        String.format("User %s is not a member of the group", splitDetail.getUserId()));
-            }
-
-            User user = userService.findUserByIdOrThrow(splitDetail.getUserId());
-            BigDecimal amount = splitDetail.getAmount().setScale(MONEY_SCALE, ROUNDING_MODE);
-            totalSplitAmount = totalSplitAmount.add(amount);
-
-            ExpenseSplit split = ExpenseSplit.builder()
-                    .user(user)
-                    .amountOwed(amount)
-                    .build();
-            splits.add(split);
-        }
-
-        if (totalSplitAmount.compareTo(expense.getTotalAmount()) != 0) {
-            throw new ValidationException(
-                    String.format("Split amounts (%s) do not equal total amount (%s)",
-                            totalSplitAmount, expense.getTotalAmount()));
-        }
-
-        log.debug("Created {} exact splits for expense", splits.size());
-        return splits;
+        SplitStrategy strategy = splitStrategyFactory.getStrategy(request.getSplitType());
+        return strategy.calculateSplits(expense, groupId, request);
     }
 
     /**
